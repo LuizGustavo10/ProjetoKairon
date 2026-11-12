@@ -22,7 +22,8 @@ class DemoSeeder extends Seeder
         $password = password_hash('123456', PASSWORD_DEFAULT);
         $people = [
             ['1001', 'Marina Costa', 'marina@example.com', 'manager'],
-            ['2001', 'Beatriz Almeida', 'beatriz@example.com', 'coordinator'],
+            ['2001', 'Adriana', 'adriana@example.com', 'coordinator'],
+            ['2002', 'Giselle', 'giselle@example.com', 'coordinator'],
             ['3001', 'Ana Martins', 'ana@example.com', 'instructor'],
             ['3002', 'Lucas Ferreira', 'lucas@example.com', 'instructor'],
             ['3003', 'Rafael Oliveira', 'rafael@example.com', 'instructor'],
@@ -51,10 +52,16 @@ class DemoSeeder extends Seeder
         $this->db->table('tablet_pools')->insert(['name' => 'Tablets · Unidade Londrina', 'quantity' => 30]);
         $tabletId = (int) $this->db->insertID();
         $vehicleIds = [];
-        foreach ([['Fiat Cronos', 'SNC1A01', 5], ['Chevrolet Spin', 'SNC2B02', 7], ['Renault Master', 'SNC3C03', 16]] as [$name, $plate, $seats]) {
+        foreach ([['Voyage1', 'SNC1A01', 5], ['Voyage2', 'SNC2B02', 5], ['Argo', 'SNC3C03', 5]] as [$name, $plate, $seats]) {
             $this->db->table('vehicles')->insert(['name' => $name, 'plate' => $plate, 'seats' => $seats]);
             $vehicleIds[] = (int) $this->db->insertID();
         }
+        $externalDestinations = [
+            ['Planaltina do Paraná', -23.0200, -52.9200],
+            ['Santa Cruz de Monte Castelo', -22.9586, -53.2972],
+            ['Loanda', -22.9228, -53.1369],
+        ];
+        $externalTripIndex = 0;
         // Full current month, with distinct rooms/classes and no overlapping instructor assignments.
         for ($day = $first; $day->format('Y-m') === $first->format('Y-m'); $day = $day->modify('+1 day')) {
             if ((int) $day->format('N') > 5) { continue; }
@@ -64,14 +71,19 @@ class DemoSeeder extends Seeder
                 $external = ($index === 1 && $day->format('N') === '2') || ($index === 2 && $day->format('N') === '4');
                 $start = $index === 2 ? '18:00:00' : '08:00:00';
                 $end = $index === 2 ? '22:00:00' : '12:00:00';
-                $city = $external ? ($index === 1 ? 'Apucarana' : 'Cambé') : 'Londrina';
-                $lat = $external ? ($index === 1 ? -23.5508 : -23.2769) : -23.3045;
-                $lng = $external ? ($index === 1 ? -51.4605 : -51.2797) : -51.1696;
+                if ($external) {
+                    [$city, $lat, $lng] = $externalDestinations[$externalTripIndex % count($externalDestinations)];
+                    $tripVehicleId = $vehicleIds[$externalTripIndex % count($vehicleIds)];
+                    $externalTripIndex++;
+                } else {
+                    [$city, $lat, $lng] = ['Londrina', -23.3045, -51.1696];
+                    $tripVehicleId = null;
+                }
                 $location = $external ? 'Unidade parceira · ' . $city : 'Senac Londrina';
                 $this->db->table('lessons')->insert(['class_id' => $classIds[$classIndex], 'instructor_id' => $ids[$badge], 'room_id' => $external ? null : $roomIds[$index], 'location' => $location, 'city' => $city, 'latitude' => $lat, 'longitude' => $lng, 'starts_at' => $date . ' ' . $start, 'ends_at' => $date . ' ' . $end, 'content' => ['Planejamento e atividade prática em equipe.', 'Estudo de caso e atendimento humanizado.', 'Oficina prática: desenvolvimento de um projeto.'][$index], 'created_by' => $ids['2001'], 'updated_at' => $stamp]);
                 $lessonId = (int) $this->db->insertID();
                 if ($external) {
-                    $this->db->table('trips')->insert(['vehicle_id' => $vehicleIds[$index - 1], 'instructor_id' => $ids[$badge], 'lesson_id' => $lessonId, 'city' => $city, 'destination' => $location, 'latitude' => $lat, 'longitude' => $lng, 'starts_at' => $date . ($index === 1 ? ' 07:00:00' : ' 17:00:00'), 'ends_at' => $date . ($index === 1 ? ' 13:00:00' : ' 23:00:00'), 'notes' => 'Programação demonstrativa de curso externo.', 'created_by' => $ids['2001']]);
+                    $this->db->table('trips')->insert(['vehicle_id' => $tripVehicleId, 'instructor_id' => $ids[$badge], 'lesson_id' => $lessonId, 'city' => $city, 'destination' => $location, 'latitude' => $lat, 'longitude' => $lng, 'starts_at' => $date . ($index === 1 ? ' 07:00:00' : ' 17:00:00'), 'ends_at' => $date . ($index === 1 ? ' 13:00:00' : ' 23:00:00'), 'notes' => 'Programação demonstrativa de curso externo.', 'created_by' => $ids['2001']]);
                 }
             }
         }
@@ -98,6 +110,6 @@ class DemoSeeder extends Seeder
         $this->db->table('changes')->insert(['kind' => 'demo', 'created_at' => $stamp]);
         $this->db->transComplete();
         if ($this->db->transStatus() === false) { throw new \RuntimeException('Não foi possível criar os dados de demonstração.'); }
-        echo "Demonstração criada. Crachás 1001 / 2001 / 3001 / 3002 / 3003 / 4001. Senha inicial: 123456 (troca obrigatória).\n";
+        echo "Demonstração criada. Crachás 1001 / 2001 / 2002 / 3001 / 3002 / 3003 / 4001. Senha inicial: 123456 (troca obrigatória).\n";
     }
 }

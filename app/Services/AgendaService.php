@@ -173,7 +173,6 @@ class AgendaService
             if ($roomId) { $this->row('rooms', $roomId); }
             $location = $this->text($data['location'] ?? '', 'o local da aula', 190, !$roomId);
             $city = $this->text($data['city'] ?? $class['city'], 'a cidade', 120, false);
-            [$lat, $lng] = $this->coordinates($data);
             foreach (['class_id' => ['id' => $class['id'], 'message' => 'Esta turma já tem um instrutor neste horário.'], 'instructor_id' => ['id' => $instructor['id'], 'message' => 'Este instrutor já tem uma aula neste horário.']] as $field => $check) {
                 if ($this->conflict('lessons', [$field => $check['id']], $start, $end, $id)) { throw new DomainException($check['message']); }
             }
@@ -191,7 +190,7 @@ class AgendaService
                     }
                 }
             }
-            $record = ['class_id' => (int) $class['id'], 'instructor_id' => (int) $instructor['id'], 'room_id' => $roomId, 'location' => $location, 'city' => $city, 'latitude' => $lat, 'longitude' => $lng, 'starts_at' => $start, 'ends_at' => $end, 'content' => $this->text($data['content'] ?? '', 'o conteúdo', 10000, false), 'created_by' => $old['created_by'] ?? $user['id'], 'updated_at' => $this->now()];
+            $record = ['class_id' => (int) $class['id'], 'instructor_id' => (int) $instructor['id'], 'room_id' => $roomId, 'location' => $location, 'city' => $city, 'starts_at' => $start, 'ends_at' => $end, 'content' => $this->text($data['content'] ?? '', 'o conteúdo', 10000, false), 'created_by' => $old['created_by'] ?? $user['id'], 'updated_at' => $this->now()];
             if ($id) { $this->db->table('lessons')->where('id', $id)->update($record); }
             else { $this->db->table('lessons')->insert($record); $id = (int) $this->db->insertID(); }
             $title = $old ? 'Sua agenda foi atualizada' : 'Nova aula na sua agenda';
@@ -406,6 +405,15 @@ class AgendaService
         if (!preg_match('/^\d{4}-(0[1-9]|1[0-2])$/', $month) || substr($month, 0, 4) < '2000' || substr($month, 0, 4) > '2100') { throw new DomainException('Selecione um mês válido.'); }
         $start = $month . '-01 00:00:00';
         $end = (new DateTimeImmutable($start))->modify('+1 month')->format('Y-m-d H:i:s');
+        $cycleEndDate = new DateTimeImmutable($month . '-20 00:00:00');
+        $cycleStartDate = $cycleEndDate->modify('-1 month');
+        $cycleStart = $cycleStartDate->format('Y-m-d H:i:s');
+        $cycleEnd = $cycleEndDate->format('Y-m-d H:i:s');
+        $hourCycle = [
+            'starts_on' => $cycleStartDate->format('Y-m-d'),
+            'ends_on' => $cycleEndDate->format('Y-m-d'),
+            'label' => $cycleStartDate->format('d/m/Y') . ' a ' . $cycleEndDate->format('d/m/Y'),
+        ];
         $isManager = $user['role'] === 'manager';
         $management = in_array($user['role'], ['manager', 'coordinator'], true);
         $student = $user['role'] === 'student';
@@ -427,9 +435,21 @@ class AgendaService
         elseif (!$student) { $users = [$safeUser]; }
         $requests = [];
         if (!$student) {
-            $query = $this->db->table('hour_requests h')->select('h.*, u.name AS user_name, r.name AS reviewer_name')->join('users u', 'u.id=h.user_id')->join('users r', 'r.id=h.reviewed_by', 'left')->where('h.work_date >=', substr($start, 0, 10))->where('h.work_date <', substr($end, 0, 10));
+            $query = $this->db->table('hour_requests h')->select('h.*, u.name AS user_name, r.name AS reviewer_name')->join('users u', 'u.id=h.user_id')->join('users r', 'r.id=h.reviewed_by', 'left')->where('h.work_date >=', substr($cycleStart, 0, 10))->where('h.work_date <', substr($cycleEnd, 0, 10));
             if (!$isManager) { $query->where('h.user_id', $user['id']); }
             $requests = $query->orderBy('h.created_at', 'DESC')->orderBy('h.id', 'DESC')->get()->getResultArray();
+        }
+        $outsideHours = [];
+        if (!$student) {
+            $outsideQuery = $this->db->table('hour_requests h')
+                ->select('h.id,h.user_id,h.work_date,h.hours,h.reason,h.manager_note,h.reviewed_at,u.name AS user_name,r.name AS reviewer_name')
+                ->join('users u', 'u.id=h.user_id')
+                ->join('users r', 'r.id=h.reviewed_by', 'left')
+                ->where('h.status', 'approved')
+                ->where('h.work_date >=', substr($start, 0, 10))
+                ->where('h.work_date <', substr($end, 0, 10));
+            if (!$management) { $outsideQuery->where('h.user_id', $user['id']); }
+            $outsideHours = $outsideQuery->orderBy('h.work_date')->orderBy('u.name')->orderBy('h.id')->get()->getResultArray();
         }
         $trips = [];
         if ($management) { $trips = $this->db->table('trips t')->select('t.*, v.name AS vehicle_name, v.plate AS vehicle_plate, u.name AS instructor_name')->join('vehicles v', 'v.id=t.vehicle_id')->join('users u', 'u.id=t.instructor_id')->where('t.starts_at <', $end)->where('t.ends_at >', $start)->orderBy('t.starts_at')->get()->getResultArray(); }
@@ -450,16 +470,16 @@ class AgendaService
             else { $peopleQuery->where('id', $user['id']); }
             foreach ($peopleQuery->orderBy('name')->get()->getResultArray() as $person) {
                 $scheduled = 0; $completed = 0;
-                foreach ($this->db->table('lessons')->where('instructor_id', $person['id'])->where('starts_at <', $end)->where('ends_at >', $start)->get()->getResultArray() as $lesson) {
-                    $from = max(strtotime($start), strtotime($lesson['starts_at']));
-                    $to = min(strtotime($end), strtotime($lesson['ends_at']));
+                foreach ($this->db->table('lessons')->where('instructor_id', $person['id'])->where('starts_at <', $cycleEnd)->where('ends_at >', $cycleStart)->get()->getResultArray() as $lesson) {
+                    $from = max(strtotime($cycleStart), strtotime($lesson['starts_at']));
+                    $to = min(strtotime($cycleEnd), strtotime($lesson['ends_at']));
                     $scheduled += max(0, $to - $from) / 3600;
                     $completed += max(0, min($to, strtotime($this->now())) - $from) / 3600;
                 }
-                $outside = (float) ($this->db->table('hour_requests')->selectSum('hours', 'total')->where(['user_id' => $person['id'], 'status' => 'approved'])->where('work_date >=', substr($start, 0, 10))->where('work_date <', substr($end, 0, 10))->get()->getRowArray()['total'] ?? 0);
+                $outside = (float) ($this->db->table('hour_requests')->selectSum('hours', 'total')->where(['user_id' => $person['id'], 'status' => 'approved'])->where('work_date >=', substr($cycleStart, 0, 10))->where('work_date <', substr($cycleEnd, 0, 10))->get()->getRowArray()['total'] ?? 0);
                 $summary[] = ['user_id' => (int) $person['id'], 'name' => $person['name'], 'class_hours' => round($scheduled, 2), 'completed_class_hours' => round($completed, 2), 'outside_hours' => round($outside, 2), 'total_hours' => round($scheduled + $outside, 2), 'level' => $outside >= 50 ? 'danger' : ($outside >= 40 ? 'warning' : 'normal')];
             }
         }
-        return ['user' => $safeUser, 'month' => $month, 'users' => $users, 'courses' => $this->db->table('courses')->orderBy('name')->get()->getResultArray(), 'classes' => $this->db->table('classes c')->select('c.*, co.name AS course_name, co.color AS course_color')->join('courses co', 'co.id=c.course_id')->orderBy('c.name')->get()->getResultArray(), 'rooms' => $student ? [] : $this->db->table('rooms')->orderBy('name')->get()->getResultArray(), 'tablet_pools' => $student ? [] : $this->db->table('tablet_pools')->orderBy('name')->get()->getResultArray(), 'vehicles' => $management ? $this->db->table('vehicles')->orderBy('name')->get()->getResultArray() : [], 'lessons' => $lessonRows, 'requests' => $requests, 'trips' => $trips, 'reservations' => $reservations, 'summary' => $summary] + $updates;
+        return ['user' => $safeUser, 'month' => $month, 'hour_cycle' => $hourCycle, 'users' => $users, 'courses' => $this->db->table('courses')->orderBy('name')->get()->getResultArray(), 'classes' => $this->db->table('classes c')->select('c.*, co.name AS course_name, co.color AS course_color')->join('courses co', 'co.id=c.course_id')->orderBy('c.name')->get()->getResultArray(), 'rooms' => $student ? [] : $this->db->table('rooms')->orderBy('name')->get()->getResultArray(), 'tablet_pools' => $student ? [] : $this->db->table('tablet_pools')->orderBy('name')->get()->getResultArray(), 'vehicles' => $management ? $this->db->table('vehicles')->orderBy('name')->get()->getResultArray() : [], 'lessons' => $lessonRows, 'requests' => $requests, 'outside_hours' => $outsideHours, 'trips' => $trips, 'reservations' => $reservations, 'summary' => $summary] + $updates;
     }
 }

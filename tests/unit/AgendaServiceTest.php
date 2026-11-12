@@ -191,6 +191,30 @@ final class AgendaServiceTest extends CIUnitTestCase
         self::assertEquals(8, $this->summary()['outside_hours']);
     }
 
+    public function testOnlyApprovedOutsideHoursAppearInTheScopedAgenda(): void
+    {
+        $request = $this->agenda->requestHours($this->instructor, [
+            'work_date' => '2026-11-11',
+            'hours' => 4,
+            'reason' => 'Preparação de materiais e planejamento pedagógico.',
+        ]);
+
+        self::assertSame([], $this->agenda->bootstrap($this->coordinator, '2026-11')['outside_hours']);
+
+        $this->agenda->reviewHours($this->manager, (int) $request['id'], [
+            'status' => 'approved',
+            'manager_note' => 'Atividade autorizada.',
+        ]);
+
+        $managementItems = $this->agenda->bootstrap($this->coordinator, '2026-11')['outside_hours'];
+        self::assertCount(1, $managementItems);
+        self::assertSame('2026-11-11', $managementItems[0]['work_date']);
+        self::assertEquals(4, $managementItems[0]['hours']);
+        self::assertCount(1, $this->agenda->bootstrap($this->instructor, '2026-11')['outside_hours']);
+        self::assertSame([], $this->agenda->bootstrap($this->otherInstructor, '2026-11')['outside_hours']);
+        self::assertSame([], $this->agenda->bootstrap($this->student, '2026-11')['outside_hours']);
+    }
+
     public function testMonthlyWarningThresholdsAreInclusiveAt40And50Hours(): void
     {
         foreach ([['2026-11-01', 20], ['2026-11-02', 19.5]] as [$date, $hours]) {
@@ -223,13 +247,29 @@ final class AgendaServiceTest extends CIUnitTestCase
         self::assertSame([], $this->agenda->bootstrap($this->otherInstructor, '2026-11')['requests']);
     }
 
-    public function testLessonsCrossingMonthBoundaryContributeOnlyTheirDurationInEachMonth(): void
+    public function testLessonsCrossingDay20BoundaryContributeOnlyTheirDurationInEachCycle(): void
     {
-        $this->agenda->saveLesson($this->manager, $this->lesson(['starts_at' => '2020-01-31 23:00:00', 'ends_at' => '2020-02-01 02:00:00']));
+        $this->agenda->saveLesson($this->manager, $this->lesson(['starts_at' => '2020-01-19 23:00:00', 'ends_at' => '2020-01-20 02:00:00']));
         self::assertEquals(1, $this->summary('2020-01')['class_hours']);
         self::assertEquals(2, $this->summary('2020-02')['class_hours']);
         self::assertEquals(1, $this->summary('2020-01')['completed_class_hours']);
         self::assertEquals(2, $this->summary('2020-02')['total_hours']);
+    }
+
+    public function testHourCycleStartsOnDay20AndEndsBeforeTheNextDay20(): void
+    {
+        $this->approve('2026-10-19', 3);
+        $this->approve('2026-10-20', 4);
+        $this->approve('2026-11-19', 5);
+        $this->approve('2026-11-20', 6);
+
+        $november = $this->agenda->bootstrap($this->instructor, '2026-11');
+        self::assertSame('2026-10-20', $november['hour_cycle']['starts_on']);
+        self::assertSame('2026-11-20', $november['hour_cycle']['ends_on']);
+        self::assertSame('20/10/2026 a 20/11/2026', $november['hour_cycle']['label']);
+        self::assertEquals(9, $november['summary'][0]['outside_hours']);
+        self::assertSame(['2026-11-19', '2026-10-20'], array_column($november['requests'], 'work_date'));
+        self::assertEquals(6, $this->summary('2026-12')['outside_hours']);
     }
 
     public function testRoomReservationAndLessonConflictsAreCheckedInBothDirections(): void
@@ -278,6 +318,18 @@ final class AgendaServiceTest extends CIUnitTestCase
         self::assertSame(0, $this->db->table('reservations')->countAllResults());
         self::assertSame(0, $this->db->table('trips')->countAllResults());
         self::assertSame(0, $this->db->table('hour_requests')->countAllResults());
+    }
+
+    public function testLessonSchedulingIgnoresCoordinatesFromTheRequest(): void
+    {
+        $lesson = $this->agenda->saveLesson($this->manager, $this->lesson([
+            'latitude' => -25.4284,
+            'longitude' => -49.2733,
+        ]));
+        $stored = $this->db->table('lessons')->where('id', $lesson['id'])->get()->getRowArray();
+
+        self::assertNull($stored['latitude']);
+        self::assertNull($stored['longitude']);
     }
 
     public function testReadNotificationsAffectsOnlyTheCurrentUser(): void
