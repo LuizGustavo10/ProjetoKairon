@@ -15,8 +15,13 @@ $routes->group('api', ['filter' => 'auth'], static function (RouteCollection $ro
     $routes->put('lessons/(:num)', 'Api::saveLesson/$1');
     $routes->delete('lessons/(:num)', 'Api::deleteLesson/$1');
     $routes->patch('lessons/(:num)/content', 'Api::saveContent/$1');
+    $routes->post('course-plans', 'Api::createCoursePlans');
+    $routes->post('course-schedules', 'Api::scheduleCourseInstructor');
+    $routes->delete('course-plans/(:num)', 'Api::deleteCoursePlan/$1');
     $routes->post('hours', 'Api::requestHours');
     $routes->patch('hours/(:num)/review', 'Api::reviewHours/$1');
+    $routes->post('schedule-blocks', 'Api::saveScheduleBlock');
+    $routes->patch('schedule-blocks/(:num)/review', 'Api::reviewScheduleBlock/$1');
     $routes->post('trips', 'Api::saveTrip');
     $routes->put('trips/(:num)', 'Api::saveTrip/$1');
     $routes->delete('trips/(:num)', 'Api::deleteTrip/$1');

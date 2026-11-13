@@ -69,6 +69,38 @@ class AgendaService
         return $row;
     }
 
+    private function ensureCourseClass(array $course): int
+    {
+        $existing = $this->db->table('classes')->where('course_id', (int) $course['id'])->orderBy('id', 'ASC')->get()->getRowArray();
+        if ($existing) { return (int) $existing['id']; }
+        $base = 'CURSO-' . (int) $course['id'];
+        $code = $base;
+        $suffix = 1;
+        while ($this->db->table('classes')->where('code', $code)->countAllResults()) { $code = $base . '-' . $suffix++; }
+        $this->db->table('classes')->insert(['code' => $code, 'name' => $course['name'], 'course_id' => (int) $course['id'], 'city' => 'A definir']);
+        return (int) $this->db->insertID();
+    }
+
+    private function workload(int $userId, string $day): array
+    {
+        $date = new DateTimeImmutable($day);
+        $weekStart = $date->modify('monday this week')->format('Y-m-d');
+        $weekEnd = (new DateTimeImmutable($weekStart))->modify('+7 days')->format('Y-m-d');
+        $totals = ['day' => 0.0, 'week' => 0.0];
+        $lessons = $this->db->table('lessons l')->select('l.starts_at,l.ends_at,co.course_type,co.travel_out_minutes,co.travel_back_minutes')->join('classes c', 'c.id=l.class_id')->join('courses co', 'co.id=c.course_id')->where('l.instructor_id', $userId)->where('l.starts_at >=', $weekStart . ' 00:00:00')->where('l.starts_at <', $weekEnd . ' 00:00:00')->get()->getResultArray();
+        foreach ($lessons as $lesson) {
+            $hours = max(0, strtotime($lesson['ends_at']) - strtotime($lesson['starts_at'])) / 3600;
+            if ($lesson['course_type'] === 'external') { $hours += ((int) $lesson['travel_out_minutes'] + (int) $lesson['travel_back_minutes'] + 20) / 60; }
+            $totals['week'] += $hours;
+            if (substr($lesson['starts_at'], 0, 10) === $day) { $totals['day'] += $hours; }
+        }
+        foreach ($this->db->table('hour_requests')->select('work_date,hours')->where(['user_id' => $userId, 'status' => 'approved'])->where('work_date >=', $weekStart)->where('work_date <', $weekEnd)->get()->getResultArray() as $outside) {
+            $totals['week'] += (float) $outside['hours'];
+            if ($outside['work_date'] === $day) { $totals['day'] += (float) $outside['hours']; }
+        }
+        return $totals;
+    }
+
     private function instructor(mixed $id): array
     {
         $row = $this->row('users', $this->positive($id, 'o instrutor'));
@@ -202,6 +234,115 @@ class AgendaService
         });
     }
 
+    public function createCoursePlans(array $user, array $data): array
+    {
+        $this->management($user);
+        $classId = isset($data['class_id']) && (int) $data['class_id'] > 0 ? (int) $data['class_id'] : null;
+        if ($classId) {
+            $class = $this->row('classes', $classId);
+            $course = $this->row('courses', (int) $class['course_id']);
+        } else {
+            $course = $this->row('courses', $this->positive($data['course_id'] ?? null, 'o curso'));
+        }
+        $turn = $this->text($data['turn'] ?? '', 'o turno', 20);
+        $times = ['morning' => ['08:00:00', '12:00:00'], 'afternoon' => ['13:30:00', '17:30:00'], 'night' => ['19:00:00', '22:00:00']];
+        if (!isset($times[$turn])) { throw new DomainException('Selecione manhã, tarde ou noite.'); }
+        if (!$course['starts_on'] || !$course['ends_on'] || !$course['turn'] || $course['weekdays'] === null || $course['weekdays'] === '') { throw new DomainException('Configure o período, turno e dias da semana do curso antes de planejar.'); }
+        $allowOutsideSchedule = filter_var($data['allow_outside_schedule'] ?? false, FILTER_VALIDATE_BOOLEAN);
+        if (!$allowOutsideSchedule && $turn !== $course['turn']) { throw new DomainException('O planejamento deve usar o turno configurado para o curso.'); }
+        $weekdays = array_map('intval', explode(',', (string) $course['weekdays']));
+        $dates = $data['dates'] ?? null;
+        if (!is_array($dates) || !$dates || count($dates) > 62) { throw new DomainException('Selecione de 1 a 62 dias para o curso.'); }
+        $dates = array_values(array_unique($dates));
+        return $this->write(function () use ($user, $classId, $turn, $times, $dates, $course, $weekdays, $allowOutsideSchedule) {
+            $classId ??= $this->ensureCourseClass($course);
+            $created = [];
+            foreach ($dates as $day) {
+                $date = is_string($day) ? DateTimeImmutable::createFromFormat('!Y-m-d', $day) : false;
+                if (!$date || $date->format('Y-m-d') !== $day) { throw new DomainException('Uma das datas selecionadas é inválida.'); }
+                if (!$allowOutsideSchedule && ($day < $course['starts_on'] || $day > $course['ends_on'] || !in_array((int) $date->format('w'), $weekdays, true))) {
+                    throw new DomainException('Este dia não está no plano deste curso. Confirme a exceção para continuar.');
+                }
+                $start = $day . ' ' . $times[$turn][0];
+                $minutes = max(30, (int) round((float) ($course['daily_hours'] ?? 4) * 60));
+                $end = (new DateTimeImmutable($start))->modify('+' . $minutes . ' minutes')->format('Y-m-d H:i:s');
+                if ($this->conflict('lessons', ['class_id' => $classId], $start, $end) || $this->conflict('course_plans', ['class_id' => $classId], $start, $end)) {
+                    throw new DomainException('A turma já possui programação em um dos dias selecionados.');
+                }
+                $record = ['class_id' => $classId, 'starts_at' => $start, 'ends_at' => $end, 'created_by' => $user['id'], 'created_at' => $this->now()];
+                $this->db->table('course_plans')->insert($record);
+                $created[] = $record + ['id' => (int) $this->db->insertID()];
+            }
+            $this->changed('course_plan');
+            return $created;
+        });
+    }
+
+    public function deleteCoursePlan(array $user, int $id): void
+    {
+        $this->management($user);
+        $this->write(function () use ($id) {
+            $this->row('course_plans', $id);
+            $this->db->table('course_plans')->where('id', $id)->delete();
+            $this->changed('course_plan');
+        });
+    }
+
+    public function scheduleCourseInstructor(array $user, array $data): array
+    {
+        $this->management($user);
+        $course = $this->row('courses', $this->positive($data['course_id'] ?? null, 'o curso'));
+        $classId = isset($data['class_id']) && (int) $data['class_id'] > 0 ? (int) $data['class_id'] : null;
+        if ($classId) {
+            $class = $this->row('classes', $classId);
+            if ((int) $class['course_id'] !== (int) $course['id']) { throw new DomainException('A turma selecionada não pertence a este curso.'); }
+        }
+        $instructor = $this->instructor($data['instructor_id'] ?? null);
+        $turn = $this->text($data['turn'] ?? '', 'o turno', 20);
+        $times = ['morning' => ['08:00:00', '12:00:00'], 'afternoon' => ['13:30:00', '17:30:00'], 'night' => ['19:00:00', '22:00:00']];
+        if (!isset($times[$turn])) { throw new DomainException('Selecione manhã, tarde ou noite.'); }
+        $allowOutsideSchedule = filter_var($data['allow_outside_schedule'] ?? false, FILTER_VALIDATE_BOOLEAN);
+        if (!$allowOutsideSchedule && $turn !== $course['turn']) { throw new DomainException('O planejamento deve usar o turno configurado para o curso.'); }
+        $weekdays = array_map('intval', explode(',', (string) $course['weekdays']));
+        $dates = $data['dates'] ?? null;
+        if (!is_array($dates) || !$dates || count($dates) > 62) { throw new DomainException('Selecione de 1 a 62 dias para o curso.'); }
+        $dates = array_values(array_unique($dates));
+        $content = $this->text($data['content'] ?? '', 'o conteúdo', 6000, false);
+        return $this->write(function () use ($user, $course, $classId, $instructor, $turn, $times, $allowOutsideSchedule, $weekdays, $dates, $content) {
+            $classId ??= $this->ensureCourseClass($course);
+            $class = $this->row('classes', $classId);
+            $created = [];
+            foreach ($dates as $day) {
+                $date = is_string($day) ? DateTimeImmutable::createFromFormat('!Y-m-d', $day) : false;
+                if (!$date || $date->format('Y-m-d') !== $day) { throw new DomainException('Uma das datas selecionadas é inválida.'); }
+                if (!$allowOutsideSchedule && ($day < $course['starts_on'] || $day > $course['ends_on'] || !in_array((int) $date->format('w'), $weekdays, true))) { throw new DomainException('Este dia não está no plano deste curso.'); }
+                $start = $day . ' ' . $times[$turn][0];
+                $minutes = max(30, (int) round((float) ($course['daily_hours'] ?? 4) * 60));
+                $end = (new DateTimeImmutable($start))->modify('+' . $minutes . ' minutes')->format('Y-m-d H:i:s');
+                $block = $this->db->table('schedule_blocks')->where(['status' => 'approved', 'block_date' => $day])->groupStart()->where('user_id', null)->orWhere('user_id', (int) $instructor['id'])->groupEnd()->groupStart()->where('turn', 'all')->orWhere('turn', $turn)->groupEnd()->countAllResults();
+                if ($block) { throw new DomainException('A agenda do instrutor está fechada em um dos dias selecionados.'); }
+                if ($this->conflict('lessons', ['instructor_id' => (int) $instructor['id']], $start, $end)) { throw new DomainException('O instrutor já está ocupado em um dos dias selecionados.'); }
+                if ($this->conflict('trips', ['instructor_id' => (int) $instructor['id']], $start, $end)) { throw new DomainException('O instrutor possui deslocamento em um dos dias selecionados.'); }
+                if ($this->conflict('lessons', ['class_id' => $classId], $start, $end) || $this->conflict('course_plans', ['class_id' => $classId], $start, $end)) { throw new DomainException('A turma já possui programação em um dos dias selecionados.'); }
+                $newHours = max(0, strtotime($end) - strtotime($start)) / 3600;
+                if ($course['course_type'] === 'external') { $newHours += ((int) $course['travel_out_minutes'] + (int) $course['travel_back_minutes'] + 20) / 60; }
+                $load = $this->workload((int) $instructor['id'], $day);
+                if ($load['day'] + $newHours > 10.00001) { throw new DomainException('Este planejamento ultrapassa o limite de 10 horas de trabalho no dia.'); }
+                if ($load['week'] + $newHours > 44.00001) { throw new DomainException('Este planejamento ultrapassa o limite de 44 horas de trabalho na semana.'); }
+                $place = $course['location'] ?: 'A definir';
+                if (!empty($course['address'])) { $place .= ' · ' . $course['address']; }
+                $record = ['class_id' => $classId, 'instructor_id' => (int) $instructor['id'], 'room_id' => null, 'location' => $place, 'city' => $class['city'] === 'A definir' ? '' : $class['city'], 'starts_at' => $start, 'ends_at' => $end, 'content' => $content ?: (string) ($course['notes'] ?? ''), 'created_by' => (int) $user['id'], 'updated_at' => $this->now()];
+                $this->db->table('lessons')->insert($record);
+                $created[] = $record + ['id' => (int) $this->db->insertID()];
+            }
+            $lines = array_map(fn ($lesson) => date('d/m/Y H:i', strtotime($lesson['starts_at'])) . ' até ' . date('H:i', strtotime($lesson['ends_at'])), $created);
+            $travelNotice = $course['course_type'] === 'external' ? "\nCurso externo: considere " . (int) $course['travel_out_minutes'] . ' min de ida, ' . (int) $course['travel_back_minutes'] . " min de volta e chegada 20 minutos antes da saída." : '';
+            $this->notify((int) $instructor['id'], 'Novas aulas na sua agenda', $course['name'] . "\n" . implode("\n", $lines) . $travelNotice . "\nConsulte o PAC Agenda para os detalhes atualizados.", true);
+            $this->changed('lesson');
+            return $created;
+        });
+    }
+
     public function deleteLesson(array $user, int $id): void
     {
         $this->management($user);
@@ -236,14 +377,22 @@ class AgendaService
             $date = DateTimeImmutable::createFromFormat('!Y-m-d', $day);
             if (!$date || $date->format('Y-m-d') !== $day) { throw new DomainException('Informe uma data válida.'); }
             $hours = $data['hours'] ?? null;
-            if (!is_numeric($hours) || !is_finite((float) $hours) || (float) $hours <= 0 || (float) $hours > 24 || abs(round((float) $hours, 2) - (float) $hours) > 0.00001) { throw new DomainException('Informe de 0,01 a 24 horas, com até duas casas decimais.'); }
+            if (!is_numeric($hours) || !is_finite((float) $hours) || (float) $hours <= 0 || (float) $hours > 10 || abs(round((float) $hours, 2) - (float) $hours) > 0.00001) { throw new DomainException('Informe de 0,01 a 10 horas, com até duas casas decimais.'); }
             $hours = round((float) $hours, 2);
-            $existing = $this->db->table('hour_requests')->selectSum('hours', 'total')->where('user_id', $user['id'])->where('work_date', $day)->whereIn('status', ['pending', 'approved'])->get()->getRowArray();
-            if ((float) ($existing['total'] ?? 0) + $hours > 24) { throw new DomainException('Os pedidos ativos não podem ultrapassar 24 horas no mesmo dia.'); }
-            $record = ['user_id' => (int) $user['id'], 'work_date' => $day, 'hours' => $hours, 'reason' => $this->text($data['reason'] ?? '', 'a justificativa', 3000), 'status' => 'pending', 'manager_note' => '', 'reviewed_by' => null, 'reviewed_at' => null, 'created_at' => $this->now()];
+            $dateForWeek = new DateTimeImmutable($day);
+            $weekStart = $dateForWeek->modify('monday this week')->format('Y-m-d');
+            $weekEnd = (new DateTimeImmutable($weekStart))->modify('+7 days')->format('Y-m-d');
+            $pendingDay = (float) ($this->db->table('hour_requests')->selectSum('hours', 'total')->where(['user_id' => $user['id'], 'work_date' => $day, 'status' => 'pending'])->get()->getRowArray()['total'] ?? 0);
+            $pendingWeek = (float) ($this->db->table('hour_requests')->selectSum('hours', 'total')->where(['user_id' => $user['id'], 'status' => 'pending'])->where('work_date >=', $weekStart)->where('work_date <', $weekEnd)->get()->getRowArray()['total'] ?? 0);
+            $load = $this->workload((int) $user['id'], $day);
+            if ($load['day'] + $pendingDay + $hours > 10.00001) { throw new DomainException('A solicitação ultrapassa o limite de 10 horas de trabalho no dia.'); }
+            if ($load['week'] + $pendingWeek + $hours > 44.00001) { throw new DomainException('A solicitação ultrapassa o limite de 44 horas de trabalho na semana.'); }
+            $turn = $this->text($data['turn'] ?? 'morning', 'o turno', 20);
+            if (!in_array($turn, ['morning', 'afternoon', 'night'], true)) { throw new DomainException('Selecione o turno das horas fora de sala.'); }
+            $record = ['user_id' => (int) $user['id'], 'work_date' => $day, 'turn' => $turn, 'hours' => $hours, 'reason' => $this->text($data['reason'] ?? '', 'a justificativa', 3000), 'status' => 'pending', 'manager_note' => '', 'reviewed_by' => null, 'reviewed_at' => null, 'created_at' => $this->now()];
             $this->db->table('hour_requests')->insert($record);
             $id = (int) $this->db->insertID();
-            foreach ($this->db->table('users')->where(['role' => 'manager', 'active' => 1])->get()->getResultArray() as $manager) { $this->notify((int) $manager['id'], 'Novo pedido de horas', $user['name'] . ' solicitou ' . $hours . 'h fora de sala para ' . date('d/m/Y', strtotime($day)) . '.'); }
+            foreach ($this->db->table('users')->whereIn('role', ['manager', 'coordinator'])->where('active', 1)->get()->getResultArray() as $reviewer) { $this->notify((int) $reviewer['id'], 'Novo pedido de horas', $user['name'] . ' solicitou ' . $hours . 'h fora de sala para ' . date('d/m/Y', strtotime($day)) . '.'); }
             $this->changed('hours');
             return $record + ['id' => $id];
         });
@@ -251,7 +400,7 @@ class AgendaService
 
     public function reviewHours(array $user, int $id, array $data): void
     {
-        $this->roles($user, ['manager']);
+        $this->roles($user, ['manager', 'coordinator']);
         $this->write(function () use ($user, $id, $data) {
             $request = $this->row('hour_requests', $id);
             if ($request['status'] !== 'pending') { throw new DomainException('Este pedido já foi analisado.'); }
@@ -261,6 +410,45 @@ class AgendaService
             $this->db->table('hour_requests')->where('id', $id)->update(['status' => $status, 'manager_note' => $note, 'reviewed_by' => $user['id'], 'reviewed_at' => $this->now()]);
             $this->notify((int) $request['user_id'], $status === 'approved' ? 'Pedido de horas aprovado' : 'Pedido de horas recusado', $request['hours'] . 'h em ' . date('d/m/Y', strtotime($request['work_date'])) . ($note ? '. Parecer: ' . $note : '. As horas já estão no seu total do mês.'));
             $this->changed('hours');
+        });
+    }
+
+    public function saveScheduleBlock(array $user, array $data): array
+    {
+        $this->staff($user);
+        return $this->write(function () use ($user, $data) {
+            $day = $this->text($data['block_date'] ?? '', 'a data', 10);
+            $date = DateTimeImmutable::createFromFormat('!Y-m-d', $day);
+            if (!$date || $date->format('Y-m-d') !== $day) { throw new DomainException('Informe uma data válida.'); }
+            $turn = $this->text($data['turn'] ?? '', 'o turno', 20);
+            if (!in_array($turn, ['all', 'morning', 'afternoon', 'night'], true)) { throw new DomainException('Selecione um turno válido.'); }
+            $type = $this->text($data['type'] ?? '', 'o tipo de fechamento', 30);
+            if (!in_array($type, ['holiday', 'formative', 'call', 'travel', 'medical', 'personal', 'other'], true)) { throw new DomainException('Selecione o motivo do fechamento.'); }
+            $management = in_array($user['role'], ['manager', 'coordinator'], true);
+            $global = $management && filter_var($data['global'] ?? false, FILTER_VALIDATE_BOOLEAN);
+            $record = ['user_id' => $global ? null : (int) $user['id'], 'block_date' => $day, 'turn' => $turn, 'type' => $type, 'reason' => $this->text($data['reason'] ?? '', 'a justificativa', 3000), 'status' => $management ? 'approved' : 'pending', 'requested_by' => (int) $user['id'], 'reviewed_by' => $management ? (int) $user['id'] : null, 'review_note' => '', 'reviewed_at' => $management ? $this->now() : null, 'created_at' => $this->now()];
+            $this->db->table('schedule_blocks')->insert($record);
+            $id = (int) $this->db->insertID();
+            if (!$management) {
+                foreach ($this->db->table('users')->whereIn('role', ['manager', 'coordinator'])->where('active', 1)->get()->getResultArray() as $reviewer) { $this->notify((int) $reviewer['id'], 'Novo pedido de fechamento de agenda', $user['name'] . ' pediu bloqueio em ' . date('d/m/Y', strtotime($day)) . '.'); }
+            }
+            $this->changed('schedule_block');
+            return $record + ['id' => $id];
+        });
+    }
+
+    public function reviewScheduleBlock(array $user, int $id, array $data): void
+    {
+        $this->management($user);
+        $this->write(function () use ($user, $id, $data) {
+            $block = $this->row('schedule_blocks', $id);
+            if ($block['status'] !== 'pending') { throw new DomainException('Este pedido já foi analisado.'); }
+            $status = (string) ($data['status'] ?? '');
+            if (!in_array($status, ['approved', 'rejected'], true)) { throw new DomainException('Selecione aprovar ou recusar.'); }
+            $note = $this->text($data['review_note'] ?? '', 'o parecer', 2000, $status === 'rejected');
+            $this->db->table('schedule_blocks')->where('id', $id)->update(['status' => $status, 'reviewed_by' => (int) $user['id'], 'review_note' => $note, 'reviewed_at' => $this->now()]);
+            $this->notify((int) $block['requested_by'], $status === 'approved' ? 'Fechamento de agenda aprovado' : 'Fechamento de agenda recusado', date('d/m/Y', strtotime($block['block_date'])) . ($note ? '. Parecer: ' . $note : '.'));
+            $this->changed('schedule_block');
         });
     }
 
@@ -351,6 +539,39 @@ class AgendaService
                 $color = (string) ($data['color'] ?? '');
                 if (!preg_match('/^#[0-9a-fA-F]{6}$/', $color)) { throw new DomainException('Selecione uma cor válida para o curso.'); }
                 $record['color'] = $color;
+                $startsOn = (string) ($data['starts_on'] ?? '');
+                $endsOn = (string) ($data['ends_on'] ?? '');
+                $startDate = DateTimeImmutable::createFromFormat('!Y-m-d', $startsOn);
+                $endDate = DateTimeImmutable::createFromFormat('!Y-m-d', $endsOn);
+                if (!$startDate || $startDate->format('Y-m-d') !== $startsOn || !$endDate || $endDate->format('Y-m-d') !== $endsOn) { throw new DomainException('Informe um período válido para o curso.'); }
+                if ($endsOn < $startsOn) { throw new DomainException('A finalização do curso deve ser posterior ao início.'); }
+                $turn = (string) ($data['turn'] ?? '');
+                if (!in_array($turn, ['morning', 'afternoon', 'night'], true)) { throw new DomainException('Selecione o turno do curso.'); }
+                $weekdays = $data['weekdays'] ?? null;
+                if (!is_array($weekdays)) { throw new DomainException('Selecione pelo menos um dia da semana.'); }
+                $weekdays = array_values(array_unique(array_map('intval', $weekdays)));
+                sort($weekdays);
+                if (!$weekdays || count($weekdays) > 7 || array_filter($weekdays, static fn ($day) => $day < 0 || $day > 6)) { throw new DomainException('Selecione dias da semana válidos.'); }
+                $record += ['starts_on' => $startsOn, 'ends_on' => $endsOn, 'turn' => $turn, 'weekdays' => implode(',', $weekdays)];
+                $courseType = (string) ($data['course_type'] ?? 'internal');
+                if (!in_array($courseType, ['internal', 'external'], true)) { throw new DomainException('Informe se o curso é interno ou externo.'); }
+                $dailyHours = (float) ($data['daily_hours'] ?? 4);
+                $totalHours = (float) ($data['total_hours'] ?? 40);
+                if ($dailyHours <= 0 || $dailyHours > 10 || $totalHours <= 0 || $totalHours > 5000) { throw new DomainException('Informe a carga diária e a carga horária total do curso.'); }
+                $travelOut = $courseType === 'external' ? $this->positive($data['travel_out_minutes'] ?? null, 'o tempo de ida', 1440) : 0;
+                $travelBack = $courseType === 'external' ? $this->positive($data['travel_back_minutes'] ?? null, 'o tempo de volta', 1440) : 0;
+                $record += ['course_type' => $courseType, 'location' => $this->text($data['location'] ?? 'Unidade Senac', 'o local', 180), 'address' => $this->text($data['address'] ?? '', 'o endereço', 255, false), 'notes' => $this->text($data['notes'] ?? '', 'as observações', 3000, false), 'daily_hours' => round($dailyHours, 2), 'total_hours' => round($totalHours, 2), 'travel_out_minutes' => $travelOut, 'travel_back_minutes' => $travelBack];
+                $holidays = array_flip(array_column($this->db->table('schedule_blocks')->select('block_date')->where(['user_id' => null, 'type' => 'holiday', 'status' => 'approved'])->get()->getResultArray(), 'block_date'));
+                $remaining = (int) ceil($totalHours / $dailyHours);
+                $cursor = $startDate;
+                $guard = 0;
+                while ($remaining > 0 && $guard++ < 1900) {
+                    $cursorDay = $cursor->format('Y-m-d');
+                    if (in_array((int) $cursor->format('w'), $weekdays, true) && !isset($holidays[$cursorDay])) { $remaining--; }
+                    if ($remaining > 0) { $cursor = $cursor->modify('+1 day'); }
+                }
+                if ($remaining > 0) { throw new DomainException('Não foi possível calcular a previsão de término do curso.'); }
+                $record['ends_on'] = $cursor->format('Y-m-d');
             }
             if ($type === 'classes') {
                 $record['code'] = $this->text($data['code'] ?? '', 'o código da turma', 40);
@@ -380,8 +601,10 @@ class AgendaService
                 if ($id) { $duplicate->where('id !=', $id); }
                 if ($duplicate->countAllResults()) { throw new DomainException('Esta placa já está cadastrada.'); }
             }
+            $isNew = !$id;
             if ($id) { $this->db->table($type)->where('id', $id)->update($record); }
             else { $this->db->table($type)->insert($record); $id = (int) $this->db->insertID(); }
+            if ($type === 'courses' && $isNew) { $this->ensureCourseClass($record + ['id' => $id]); }
             $this->changed('catalog');
             return $record + ['id' => $id];
         });
@@ -405,44 +628,52 @@ class AgendaService
         if (!preg_match('/^\d{4}-(0[1-9]|1[0-2])$/', $month) || substr($month, 0, 4) < '2000' || substr($month, 0, 4) > '2100') { throw new DomainException('Selecione um mês válido.'); }
         $start = $month . '-01 00:00:00';
         $end = (new DateTimeImmutable($start))->modify('+1 month')->format('Y-m-d H:i:s');
-        $cycleEndDate = new DateTimeImmutable($month . '-20 00:00:00');
+        $cycleEndDate = new DateTimeImmutable($month . '-21 00:00:00');
         $cycleStartDate = $cycleEndDate->modify('-1 month');
         $cycleStart = $cycleStartDate->format('Y-m-d H:i:s');
         $cycleEnd = $cycleEndDate->format('Y-m-d H:i:s');
         $hourCycle = [
             'starts_on' => $cycleStartDate->format('Y-m-d'),
             'ends_on' => $cycleEndDate->format('Y-m-d'),
-            'label' => $cycleStartDate->format('d/m/Y') . ' a ' . $cycleEndDate->format('d/m/Y'),
+            'label' => $cycleStartDate->format('d/m/Y') . ' a ' . $cycleEndDate->modify('-1 day')->format('d/m/Y'),
         ];
         $isManager = $user['role'] === 'manager';
         $management = in_array($user['role'], ['manager', 'coordinator'], true);
         $student = $user['role'] === 'student';
         // Read revision first: a concurrent write during the snapshot triggers another refresh.
         $updates = $this->updates($user);
-        $safeUser = array_intersect_key($user, array_flip(['id', 'badge', 'name', 'email', 'role', 'must_change_password']));
-        $lessons = $this->db->table('lessons l')->select('l.*, c.name AS class_name, c.code AS class_code, co.name AS course_name, co.color AS course_color, u.name AS instructor_name, r.name AS room_name')->join('classes c', 'c.id=l.class_id')->join('courses co', 'co.id=c.course_id')->join('users u', 'u.id=l.instructor_id')->join('rooms r', 'r.id=l.room_id', 'left')->where('l.starts_at <', $end)->where('l.ends_at >', $start);
+        $safeUser = array_intersect_key($user, array_flip(['id', 'badge', 'name', 'email', 'photo_url', 'role', 'must_change_password']));
+        $lessons = $this->db->table('lessons l')->select('l.*, c.name AS class_name, c.code AS class_code, co.name AS course_name, co.color AS course_color, u.name AS instructor_name, u.photo_url AS instructor_photo, r.name AS room_name')->join('classes c', 'c.id=l.class_id')->join('courses co', 'co.id=c.course_id')->join('users u', 'u.id=l.instructor_id')->join('rooms r', 'r.id=l.room_id', 'left')->where('l.starts_at <', $end)->where('l.ends_at >', $start);
         if ($user['role'] === 'instructor') { $lessons->where('l.instructor_id', $user['id']); }
         if ($student) { $lessons->where('l.class_id', $classId ?: 0); }
         elseif ($classId) { $lessons->where('l.class_id', $classId); }
         $lessonRows = $lessons->orderBy('l.starts_at')->get()->getResultArray();
+        $coursePlans = [];
+        if ($management) {
+            $coursePlans = $this->db->table('course_plans p')
+                ->select('p.*, c.name AS class_name, c.code AS class_code, c.city, co.id AS course_id, co.name AS course_name, co.color AS course_color')
+                ->join('classes c', 'c.id=p.class_id')->join('courses co', 'co.id=c.course_id')
+                ->where('p.starts_at <', $end)->where('p.ends_at >', $start)
+                ->orderBy('p.starts_at')->get()->getResultArray();
+        }
         if ($student) {
             foreach ($lessonRows as &$lesson) { unset($lesson['created_by'], $lesson['latitude'], $lesson['longitude'], $lesson['instructor_id']); }
             unset($lesson);
         }
         $users = [];
-        if ($isManager) { $users = $this->db->table('users')->select('id,badge,name,email,role,active,must_change_password')->orderBy('name')->get()->getResultArray(); }
-        elseif ($management) { $users = $this->db->table('users')->select('id,badge,name,email,role,active')->where('role', 'instructor')->where('active', 1)->orderBy('name')->get()->getResultArray(); }
+        if ($isManager) { $users = $this->db->table('users')->select('id,badge,name,email,photo_url,role,active,must_change_password')->orderBy('name')->get()->getResultArray(); }
+        elseif ($management) { $users = $this->db->table('users')->select('id,badge,name,email,photo_url,role,active')->where('role', 'instructor')->where('active', 1)->orderBy('name')->get()->getResultArray(); }
         elseif (!$student) { $users = [$safeUser]; }
         $requests = [];
         if (!$student) {
             $query = $this->db->table('hour_requests h')->select('h.*, u.name AS user_name, r.name AS reviewer_name')->join('users u', 'u.id=h.user_id')->join('users r', 'r.id=h.reviewed_by', 'left')->where('h.work_date >=', substr($cycleStart, 0, 10))->where('h.work_date <', substr($cycleEnd, 0, 10));
-            if (!$isManager) { $query->where('h.user_id', $user['id']); }
+            if (!$management) { $query->where('h.user_id', $user['id']); }
             $requests = $query->orderBy('h.created_at', 'DESC')->orderBy('h.id', 'DESC')->get()->getResultArray();
         }
         $outsideHours = [];
         if (!$student) {
             $outsideQuery = $this->db->table('hour_requests h')
-                ->select('h.id,h.user_id,h.work_date,h.hours,h.reason,h.manager_note,h.reviewed_at,u.name AS user_name,r.name AS reviewer_name')
+                ->select('h.id,h.user_id,h.work_date,h.turn,h.hours,h.reason,h.manager_note,h.reviewed_at,u.name AS user_name,r.name AS reviewer_name')
                 ->join('users u', 'u.id=h.user_id')
                 ->join('users r', 'r.id=h.reviewed_by', 'left')
                 ->where('h.status', 'approved')
@@ -463,6 +694,9 @@ class AgendaService
                 $reservations[] = $reservation;
             }
         }
+        $blocksQuery = $this->db->table('schedule_blocks b')->select('b.*, u.name AS user_name, q.name AS requester_name, r.name AS reviewer_name')->join('users u', 'u.id=b.user_id', 'left')->join('users q', 'q.id=b.requested_by')->join('users r', 'r.id=b.reviewed_by', 'left')->where('b.block_date >=', substr($start, 0, 10))->where('b.block_date <', substr($end, 0, 10));
+        if (!$management) { $blocksQuery->groupStart()->where('b.user_id', null)->orWhere('b.user_id', (int) $user['id'])->groupEnd(); }
+        $scheduleBlocks = $student ? [] : $blocksQuery->orderBy('b.block_date')->orderBy('b.id')->get()->getResultArray();
         $summary = [];
         if (!$student) {
             $peopleQuery = $this->db->table('users')->select('id,name');
@@ -480,6 +714,6 @@ class AgendaService
                 $summary[] = ['user_id' => (int) $person['id'], 'name' => $person['name'], 'class_hours' => round($scheduled, 2), 'completed_class_hours' => round($completed, 2), 'outside_hours' => round($outside, 2), 'total_hours' => round($scheduled + $outside, 2), 'level' => $outside >= 50 ? 'danger' : ($outside >= 40 ? 'warning' : 'normal')];
             }
         }
-        return ['user' => $safeUser, 'month' => $month, 'hour_cycle' => $hourCycle, 'users' => $users, 'courses' => $this->db->table('courses')->orderBy('name')->get()->getResultArray(), 'classes' => $this->db->table('classes c')->select('c.*, co.name AS course_name, co.color AS course_color')->join('courses co', 'co.id=c.course_id')->orderBy('c.name')->get()->getResultArray(), 'rooms' => $student ? [] : $this->db->table('rooms')->orderBy('name')->get()->getResultArray(), 'tablet_pools' => $student ? [] : $this->db->table('tablet_pools')->orderBy('name')->get()->getResultArray(), 'vehicles' => $management ? $this->db->table('vehicles')->orderBy('name')->get()->getResultArray() : [], 'lessons' => $lessonRows, 'requests' => $requests, 'outside_hours' => $outsideHours, 'trips' => $trips, 'reservations' => $reservations, 'summary' => $summary] + $updates;
+        return ['user' => $safeUser, 'month' => $month, 'hour_cycle' => $hourCycle, 'users' => $users, 'courses' => $this->db->table('courses')->orderBy('name')->get()->getResultArray(), 'classes' => $this->db->table('classes c')->select('c.*, co.name AS course_name, co.color AS course_color')->join('courses co', 'co.id=c.course_id')->orderBy('c.name')->get()->getResultArray(), 'rooms' => $student ? [] : $this->db->table('rooms')->orderBy('name')->get()->getResultArray(), 'tablet_pools' => $student ? [] : $this->db->table('tablet_pools')->orderBy('name')->get()->getResultArray(), 'vehicles' => $management ? $this->db->table('vehicles')->orderBy('name')->get()->getResultArray() : [], 'lessons' => $lessonRows, 'course_plans' => $coursePlans, 'requests' => $requests, 'outside_hours' => $outsideHours, 'schedule_blocks' => $scheduleBlocks, 'trips' => $trips, 'reservations' => $reservations, 'summary' => $summary] + $updates;
     }
 }

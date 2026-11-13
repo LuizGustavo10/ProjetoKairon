@@ -40,7 +40,7 @@ final class AgendaServiceTest extends CIUnitTestCase
         $this->instructor = $this->user(3, 'instructor');
         $this->otherInstructor = $this->user(4, 'instructor');
         $this->student = $this->user(5, 'student');
-        $this->db->table('courses')->insert(['id' => 1, 'name' => 'Tecnologia', 'color' => '#2563eb']);
+        $this->db->table('courses')->insert(['id' => 1, 'name' => 'Tecnologia', 'color' => '#2563eb', 'starts_on' => '2026-11-01', 'ends_on' => '2026-11-30', 'turn' => 'morning', 'weekdays' => '2,4']);
         foreach ([1, 2, 3] as $id) {
             $this->db->table('classes')->insert(['id' => $id, 'code' => 'T' . $id, 'name' => 'Turma ' . $id, 'course_id' => 1, 'city' => 'Curitiba']);
             $this->db->table('rooms')->insert(['id' => $id, 'name' => 'Sala ' . $id, 'capacity' => 30]);
@@ -179,13 +179,12 @@ final class AgendaServiceTest extends CIUnitTestCase
         self::assertGreaterThan(0, $this->agenda->updates($this->otherInstructor)['unread']);
     }
 
-    public function testPendingRequestsDontCountAndOnlyManagerCanApproveExactlyOnce(): void
+    public function testPendingRequestsDontCountAndManagementCanApproveExactlyOnce(): void
     {
         $request = $this->agenda->requestHours($this->instructor, ['work_date' => '2026-11-11', 'hours' => 8, 'reason' => 'Planejamento de curso']);
         self::assertEquals(0, $this->summary()['outside_hours']);
-        $this->reject(fn () => $this->agenda->reviewHours($this->coordinator, (int) $request['id'], ['status' => 'approved', 'manager_note' => '']));
         $this->reject(fn () => $this->agenda->reviewHours($this->instructor, (int) $request['id'], ['status' => 'approved', 'manager_note' => '']));
-        $this->agenda->reviewHours($this->manager, (int) $request['id'], ['status' => 'approved', 'manager_note' => 'Aprovado']);
+        $this->agenda->reviewHours($this->coordinator, (int) $request['id'], ['status' => 'approved', 'manager_note' => 'Aprovado']);
         self::assertEquals(8, $this->summary()['outside_hours']);
         $this->reject(fn () => $this->agenda->reviewHours($this->manager, (int) $request['id'], ['status' => 'approved', 'manager_note' => '']));
         self::assertEquals(8, $this->summary()['outside_hours']);
@@ -217,14 +216,14 @@ final class AgendaServiceTest extends CIUnitTestCase
 
     public function testMonthlyWarningThresholdsAreInclusiveAt40And50Hours(): void
     {
-        foreach ([['2026-11-01', 20], ['2026-11-02', 19.5]] as [$date, $hours]) {
+        foreach ([['2026-10-22', 10], ['2026-10-29', 10], ['2026-11-05', 10], ['2026-11-12', 9.5]] as [$date, $hours]) {
             $this->approve($date, $hours);
         }
         self::assertSame('normal', $this->summary()['level']);
-        $this->approve('2026-11-03', .5);
+        $this->approve('2026-11-13', .5);
         self::assertEquals(40, $this->summary()['outside_hours']);
         self::assertSame('warning', $this->summary()['level']);
-        $this->approve('2026-11-04', 10);
+        $this->approve('2026-11-19', 10);
         self::assertEquals(50, $this->summary()['outside_hours']);
         self::assertSame('danger', $this->summary()['level']);
         $this->approve('2026-12-01', 7);
@@ -249,26 +248,26 @@ final class AgendaServiceTest extends CIUnitTestCase
 
     public function testLessonsCrossingDay20BoundaryContributeOnlyTheirDurationInEachCycle(): void
     {
-        $this->agenda->saveLesson($this->manager, $this->lesson(['starts_at' => '2020-01-19 23:00:00', 'ends_at' => '2020-01-20 02:00:00']));
+        $this->agenda->saveLesson($this->manager, $this->lesson(['starts_at' => '2020-01-20 23:00:00', 'ends_at' => '2020-01-21 02:00:00']));
         self::assertEquals(1, $this->summary('2020-01')['class_hours']);
         self::assertEquals(2, $this->summary('2020-02')['class_hours']);
         self::assertEquals(1, $this->summary('2020-01')['completed_class_hours']);
         self::assertEquals(2, $this->summary('2020-02')['total_hours']);
     }
 
-    public function testHourCycleStartsOnDay20AndEndsBeforeTheNextDay20(): void
+    public function testHourCycleStartsOnDay21AndEndsAfterDay20(): void
     {
-        $this->approve('2026-10-19', 3);
-        $this->approve('2026-10-20', 4);
-        $this->approve('2026-11-19', 5);
-        $this->approve('2026-11-20', 6);
+        $this->approve('2026-10-20', 3);
+        $this->approve('2026-10-21', 4);
+        $this->approve('2026-11-20', 5);
+        $this->approve('2026-11-21', 6);
 
         $november = $this->agenda->bootstrap($this->instructor, '2026-11');
-        self::assertSame('2026-10-20', $november['hour_cycle']['starts_on']);
-        self::assertSame('2026-11-20', $november['hour_cycle']['ends_on']);
-        self::assertSame('20/10/2026 a 20/11/2026', $november['hour_cycle']['label']);
+        self::assertSame('2026-10-21', $november['hour_cycle']['starts_on']);
+        self::assertSame('2026-11-21', $november['hour_cycle']['ends_on']);
+        self::assertSame('21/10/2026 a 20/11/2026', $november['hour_cycle']['label']);
         self::assertEquals(9, $november['summary'][0]['outside_hours']);
-        self::assertSame(['2026-11-19', '2026-10-20'], array_column($november['requests'], 'work_date'));
+        self::assertSame(['2026-11-20', '2026-10-21'], array_column($november['requests'], 'work_date'));
         self::assertEquals(6, $this->summary('2026-12')['outside_hours']);
     }
 
@@ -339,5 +338,131 @@ final class AgendaServiceTest extends CIUnitTestCase
         $this->agenda->readNotifications($this->instructor);
         self::assertEquals(0, $this->agenda->updates($this->instructor)['unread']);
         self::assertGreaterThan(0, $this->agenda->updates($this->otherInstructor)['unread']);
+    }
+
+    public function testCourseDaysCanBePlannedBeforeInstructorAllocation(): void
+    {
+        $plans = $this->agenda->createCoursePlans($this->coordinator, [
+            'class_id' => 1,
+            'turn' => 'morning',
+            'dates' => ['2026-11-03', '2026-11-05'],
+        ]);
+
+        self::assertCount(2, $plans);
+        self::assertSame('2026-11-03 08:00:00', $plans[0]['starts_at']);
+        self::assertSame('2026-11-03 12:00:00', $plans[0]['ends_at']);
+        self::assertCount(2, $this->agenda->bootstrap($this->manager, '2026-11')['course_plans']);
+        self::assertCount(0, $this->agenda->bootstrap($this->instructor, '2026-11')['course_plans']);
+
+        $this->reject(fn () => $this->agenda->createCoursePlans($this->instructor, ['class_id' => 1, 'turn' => 'morning', 'dates' => ['2026-11-07']]));
+        $this->reject(fn () => $this->agenda->createCoursePlans($this->manager, ['class_id' => 1, 'turn' => 'morning', 'dates' => ['2026-11-03']]));
+        $this->reject(fn () => $this->agenda->createCoursePlans($this->manager, ['class_id' => 1, 'turn' => 'afternoon', 'dates' => ['2026-11-10']]));
+        $this->reject(fn () => $this->agenda->createCoursePlans($this->manager, ['class_id' => 1, 'turn' => 'morning', 'dates' => ['2026-11-11']]));
+        $this->reject(fn () => $this->agenda->createCoursePlans($this->manager, ['class_id' => 1, 'turn' => 'morning', 'dates' => ['2026-12-01']]));
+
+        $this->agenda->deleteCoursePlan($this->manager, (int) $plans[0]['id']);
+        self::assertSame(1, $this->db->table('course_plans')->countAllResults());
+    }
+
+    public function testCourseCatalogStoresItsPlanningGrid(): void
+    {
+        $course = $this->agenda->saveCatalog($this->coordinator, 'courses', [
+            'name' => 'Gestão Comercial',
+            'color' => '#15803d',
+            'starts_on' => '2026-11-15',
+            'ends_on' => '2027-02-28',
+            'turn' => 'night',
+            'weekdays' => [6, 2, 4, 2],
+        ]);
+
+        self::assertSame('2,4,6', $course['weekdays']);
+        self::assertSame('night', $course['turn']);
+        self::assertSame('2026-11-15', $course['starts_on']);
+        self::assertSame('2026-12-08', $course['ends_on']);
+        self::assertSame(1, $this->db->table('classes')->where('course_id', $course['id'])->countAllResults());
+        $this->reject(fn () => $this->agenda->saveCatalog($this->manager, 'courses', [
+            'name' => 'Curso inválido', 'color' => '#15803d', 'starts_on' => '2027-02-01',
+            'ends_on' => '2027-01-01', 'turn' => 'morning', 'weekdays' => [1],
+        ]));
+    }
+
+    public function testAfternoonCourseUsesTheStandardHalfHourSchedule(): void
+    {
+        $this->db->table('courses')->where('id', 1)->update(['turn' => 'afternoon']);
+        $plans = $this->agenda->createCoursePlans($this->manager, [
+            'class_id' => 1, 'turn' => 'afternoon', 'dates' => ['2026-11-03'],
+        ]);
+
+        self::assertSame('2026-11-03 13:30:00', $plans[0]['starts_at']);
+        self::assertSame('2026-11-03 17:30:00', $plans[0]['ends_at']);
+    }
+
+    public function testPlanningExceptionCanCreateTheDefaultClassForAnExistingCourse(): void
+    {
+        $this->db->table('courses')->insert([
+            'id' => 9, 'name' => 'Curso sem turma', 'color' => '#7c3aed',
+            'starts_on' => '2026-11-01', 'ends_on' => '2026-11-30',
+            'turn' => 'morning', 'weekdays' => '2,4',
+        ]);
+
+        $plans = $this->agenda->createCoursePlans($this->coordinator, [
+            'course_id' => 9, 'turn' => 'afternoon', 'dates' => ['2026-11-11'],
+            'allow_outside_schedule' => true,
+        ]);
+
+        self::assertSame('2026-11-11 13:30:00', $plans[0]['starts_at']);
+        $class = $this->db->table('classes')->where('course_id', 9)->get()->getRowArray();
+        self::assertNotNull($class);
+        self::assertSame((int) $class['id'], (int) $plans[0]['class_id']);
+    }
+
+    public function testCoursePlanningAssignsAvailableDaysDirectlyToTheInstructor(): void
+    {
+        $lessons = $this->agenda->scheduleCourseInstructor($this->coordinator, [
+            'course_id' => 1, 'class_id' => 1, 'instructor_id' => 3,
+            'turn' => 'morning', 'dates' => ['2026-11-03', '2026-11-05'],
+        ]);
+
+        self::assertCount(2, $lessons);
+        self::assertSame('2026-11-03 08:00:00', $lessons[0]['starts_at']);
+        self::assertSame(2, $this->db->table('lessons')->where('instructor_id', 3)->countAllResults());
+        self::assertSame(1, $this->db->table('notifications')->where('user_id', 3)->countAllResults());
+        self::assertSame(1, $this->db->table('email_queue')->where('user_id', 3)->countAllResults());
+        $this->reject(fn () => $this->agenda->scheduleCourseInstructor($this->manager, [
+            'course_id' => 1, 'class_id' => 2, 'instructor_id' => 3,
+            'turn' => 'morning', 'dates' => ['2026-11-03'],
+        ]));
+    }
+
+    public function testInstructorCanRequestAgendaClosureAndCoordinatorCanApproveIt(): void
+    {
+        $block = $this->agenda->saveScheduleBlock($this->instructor, [
+            'block_date' => '2026-11-03', 'turn' => 'morning',
+            'type' => 'medical', 'reason' => 'Consulta médica agendada',
+        ]);
+        self::assertSame('pending', $block['status']);
+        $this->agenda->reviewScheduleBlock($this->coordinator, (int) $block['id'], ['status' => 'approved', 'review_note' => 'Aprovado']);
+        self::assertSame('approved', $this->db->table('schedule_blocks')->where('id', $block['id'])->get()->getRowArray()['status']);
+        $this->reject(fn () => $this->agenda->scheduleCourseInstructor($this->manager, [
+            'course_id' => 1, 'class_id' => 1, 'instructor_id' => 3,
+            'turn' => 'morning', 'dates' => ['2026-11-03'],
+        ]));
+    }
+
+    public function testExternalTravelCountsTowardTheDailyWorkLimit(): void
+    {
+        $course = $this->agenda->saveCatalog($this->manager, 'courses', [
+            'name' => 'Curso externo', 'color' => '#dc2626', 'course_type' => 'external',
+            'location' => 'Unidade externa', 'address' => 'Avenida Central, 100', 'notes' => '',
+            'starts_on' => '2026-11-01', 'ends_on' => '2026-11-30', 'turn' => 'morning',
+            'weekdays' => [2], 'daily_hours' => 4, 'total_hours' => 40,
+            'travel_out_minutes' => 30, 'travel_back_minutes' => 30,
+        ]);
+        $request = $this->agenda->requestHours($this->instructor, ['work_date' => '2026-11-03', 'turn' => 'afternoon', 'hours' => 6, 'reason' => 'Preparação de material didático']);
+        $this->agenda->reviewHours($this->coordinator, (int) $request['id'], ['status' => 'approved', 'manager_note' => '']);
+        $this->reject(fn () => $this->agenda->scheduleCourseInstructor($this->manager, [
+            'course_id' => $course['id'], 'instructor_id' => 3,
+            'turn' => 'morning', 'dates' => ['2026-11-03'],
+        ]));
     }
 }
